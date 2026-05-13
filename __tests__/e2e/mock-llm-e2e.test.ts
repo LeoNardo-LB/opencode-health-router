@@ -85,7 +85,11 @@ describe.skipIf(shouldSkip)("E2E: opencode serve + Mock LLM", () => {
         },
       },
       agent: {
-        build: { model: "e2e-primary/test-primary" },
+        build: {
+          model: "e2e-primary/test-primary",
+          mode: "primary",
+          permission: { "*": "allow" },
+        },
       },
       plugin: [`file://${PLUGIN_DIST}`],
     }
@@ -185,17 +189,24 @@ describe.skipIf(shouldSkip)("E2E: opencode serve + Mock LLM", () => {
     primaryServer.replyText("Primary response OK")
     fallbackServer.replyText("Fallback response") // Should NOT be called
 
-    // Create session via /session endpoint (POST /api/session returns HTML)
-    const sessionRes = await fetch(`http://127.0.0.1:${servePort}/session`, {
+    // Create session (result from POST /session is the session object itself)
+    const dirParam = `?directory=${encodeURIComponent(tmpDir)}`
+    const sessionRes = await fetch(`http://127.0.0.1:${servePort}/session${dirParam}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ directory: tmpDir }),
+      body: JSON.stringify({}),
     })
+    if (!sessionRes.ok) {
+      const text = await sessionRes.text()
+      console.log("Session creation failed:", sessionRes.status, text.slice(0, 200))
+    }
+    expect(sessionRes.ok).toBe(true)
     const session = await sessionRes.json()
-    const sessionID = session.data?.id ?? session.id
+    const sessionID = session.id ?? session.data?.id
+    console.log("Created session:", sessionID)
 
-    // Send prompt via /session/:id/prompt
-    await fetch(`http://127.0.0.1:${servePort}/session/${sessionID}/prompt`, {
+    // Send prompt_async (non-blocking — returns 204 immediately)
+    const promptRes = await fetch(`http://127.0.0.1:${servePort}/session/${sessionID}/prompt_async${dirParam}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -203,6 +214,14 @@ describe.skipIf(shouldSkip)("E2E: opencode serve + Mock LLM", () => {
         agent: "build",
       }),
     })
+    if (!promptRes.ok) {
+      const text = await promptRes.text()
+      console.log("Prompt failed:", promptRes.status, text.slice(0, 200))
+    }
+    expect(promptRes.ok).toBe(true)
+
+    // Wait for LLM to respond
+    await new Promise((r) => setTimeout(r, 8_000))
 
     // Wait for LLM response
     await new Promise((r) => setTimeout(r, 8_000))
@@ -232,16 +251,24 @@ describe.skipIf(shouldSkip)("E2E: opencode serve + Mock LLM", () => {
     fallbackServer.replyText("Fallback response for retry")
 
     // Create parent session
-    const sessionRes = await fetch(`http://127.0.0.1:${servePort}/api/session`, {
+    const dirParam = `?directory=${encodeURIComponent(tmpDir)}`
+    const sessionRes = await fetch(`http://127.0.0.1:${servePort}/session${dirParam}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ directory: tmpDir }),
+      body: JSON.stringify({}),
     })
+    if (!sessionRes.ok) {
+      const text = await sessionRes.text()
+      console.log("Child test: session creation failed:", sessionRes.status, text.slice(0, 200))
+    }
+    expect(sessionRes.ok).toBe(true)
     const session = await sessionRes.json()
-    const parentSessionID = session.data?.id ?? session.id
+    const parentSessionID = session.id ?? session.data?.id
+    console.log("Child test: created parent session:", parentSessionID)
 
-    // Send a task-dispatching prompt
-    await fetch(`http://127.0.0.1:${servePort}/api/session/${parentSessionID}/prompt`, {
+    // Send a task-dispatching prompt_async (non-blocking)
+    console.log("Child test: sending prompt_async...")
+    const promptRes = await fetch(`http://127.0.0.1:${servePort}/session/${parentSessionID}/prompt_async${dirParam}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -249,6 +276,11 @@ describe.skipIf(shouldSkip)("E2E: opencode serve + Mock LLM", () => {
         agent: "build",
       }),
     })
+    if (!promptRes.ok) {
+      const text = await promptRes.text()
+      console.log("Child test: prompt failed:", promptRes.status, text.slice(0, 200))
+    }
+    console.log("Child test: prompt_async returned", promptRes.status)
 
     // Wait for the 429 retry cycle to complete
     await new Promise((r) => setTimeout(r, 20_000))
