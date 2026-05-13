@@ -6,10 +6,67 @@ import { parseJSONC } from "./jsonc.js"
 import { loadConfig } from "./config/loader.js"
 import { generateTemplate } from "./config/generator.js"
 import { createLogger } from "./logging/logger.js"
+import type { Logger } from "./logging/logger.js"
 import { HealthStore } from "./health/store.js"
 import { ModelSelector } from "./selection/selector.js"
 import { handleChatMessage } from "./actions/preemptive.js"
 import { handleReactiveEvent, cleanupDedupForSession, cleanupDedupBySize } from "./actions/reactive.js"
+
+// ─── Exported testable handlers (P3 + P5) ─────────────────────────────────
+
+/** P3: Track child sessions (subagents) by parentID on session.created events */
+export function handleSessionCreated(
+  event: { type: string; properties?: { sessionID?: string; info?: { parentID?: string } } },
+  childSessions: Set<string>,
+  logger: Logger,
+): void {
+  if (event.type !== "session.created") return
+  const props = event.properties
+  const info = props?.info
+  const sessionID = props?.sessionID
+  if (info?.parentID && sessionID) {
+    childSessions.add(sessionID)
+    logger.debug("session.child_detected", {
+      sessionID,
+      parentID: info.parentID,
+    })
+  }
+}
+
+/** P5: Enhance task tool output with 429 context for aborted child sessions */
+export function handleToolExecuteAfter(
+  input: { tool: string; sessionID?: string },
+  output: { output?: unknown; metadata?: unknown },
+  abortedChildren: Set<string>,
+  logger: Logger,
+): void {
+  if (input.tool !== "task") return
+
+  const metadata = output.metadata as Record<string, unknown> | undefined
+  const childSessionID = metadata?.sessionId as string | undefined
+  if (!childSessionID) return
+
+  if (!abortedChildren.has(childSessionID)) return
+  abortedChildren.delete(childSessionID)
+
+  const currentOutput = String(output.output || "")
+  const modelInfo = metadata?.model as { providerID?: string; modelID?: string } | undefined
+  const modelName = modelInfo ? `${modelInfo.providerID}/${modelInfo.modelID}` : "模型"
+
+  output.output = [
+    currentOutput,
+    "",
+    "---",
+    `⚠️ 子会话 ${childSessionID} 因 ${modelName} 429 限流中断`,
+    `重试时请在新子会话中执行: opencode export ${childSessionID} 2>&1 | tail -200`,
+    `查看方法: 看第一句(任务目标) + 最后几句(已完成的工作)`,
+  ].join("\n")
+
+  logger.info("tool.after.task_enhanced", {
+    parentSessionID: input.sessionID,
+    childSessionID,
+  })
+}
 
 // ─── Module-level shared state ──────────────────────────────────────────
 // OpenCode creates two plugin instances per project (calls server() twice).
@@ -25,6 +82,8 @@ let sharedDedupSet: Set<string> | null = null
 let sharedPluginPromptedSessions: Set<string> | null = null
 let sharedHandledRetrySessions: Set<string> | null = null
 let sharedMessageCache: Map<string, Array<{ modelKey: string; agentName: string; messageID: string }>> | null = null
+let sharedChildSessions: Set<string> | null = null
+let sharedAbortedChildren: Set<string> | null = null
 let tickTimerStarted = false
 
 export default {
@@ -81,6 +140,8 @@ export default {
   // Cache user message metadata keyed by sessionID — used by reactive handler
   // to read the ORIGINAL model (not the fallback model from a prior prompt() call)
   if (!sharedMessageCache) sharedMessageCache = new Map<string, Array<{ modelKey: string; agentName: string; messageID: string }>>()
+  if (!sharedChildSessions) sharedChildSessions = new Set<string>()
+  if (!sharedAbortedChildren) sharedAbortedChildren = new Set<string>()
 
   const store = sharedStore
   const selector = sharedSelector
@@ -88,6 +149,8 @@ export default {
   const pluginPromptedSessions = sharedPluginPromptedSessions
   const handledRetrySessions = sharedHandledRetrySessions
   const messageCache = sharedMessageCache
+  const childSessions = sharedChildSessions
+  const abortedChildren = sharedAbortedChildren
 
   logger.debug("plugin.components_initialized", {
     agents: Object.keys(config.agents),
@@ -121,7 +184,7 @@ export default {
     }
   }
 
-  logger.info("plugin.hooks_returning", { hooks: ["chat.message", "event"] })
+  logger.info("plugin.hooks_returning", { hooks: ["chat.message", "event", "tool.execute.after"] })
 
   return {
     "chat.message": async (input: any, output: any) => {
@@ -199,6 +262,9 @@ export default {
         if (sessionID) cleanupDedupForSession(dedupSet, sessionID)
       }
 
+      // Track child sessions (subagents) by parentID (P3)
+      handleSessionCreated(event, childSessions!, logger)
+
       // Only clean session-level sets on session.deleted
       if (event.type === "session.deleted") {
         const sessionID = (event.properties as { sessionID?: string } | undefined)?.sessionID
@@ -206,6 +272,8 @@ export default {
           pluginPromptedSessions.delete(sessionID)
           messageCache.delete(sessionID)
           handledRetrySessions.delete(sessionID)
+          childSessions?.delete(sessionID)
+          abortedChildren?.delete(sessionID)
         }
       }
 
@@ -221,8 +289,15 @@ export default {
         pluginPromptedSessions,
         messageCache,
         handledRetrySessions,
+        childSessions,
+        abortedChildren,
       })
      },
+
+    "tool.execute.after": async (input: any, output: any) => {
+      // P5: enhance task output with 429 context for aborted child sessions
+      handleToolExecuteAfter(input, output, abortedChildren!, logger)
+    },
     // Note: OpenCode Plugin API does not have a `cleanup` hook.
     // The tick timer uses `unref()` so it won't block process shutdown.
     // Timer is a small memory cost (one interval handle) — acceptable tradeoff.

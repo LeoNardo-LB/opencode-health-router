@@ -35,6 +35,10 @@ interface ReactiveContext {
   messageCache: Map<string, Array<{ modelKey: string; agentName: string; messageID: string }>>
   /** Anti-cascading: prevents re-processing retry events after a fallback chain has already executed */
   handledRetrySessions: Set<string>
+  /** Set of child session IDs (subagents) — used to detect subagent sessions */
+  childSessions?: Set<string>
+  /** Set of aborted child session IDs — consumed by tool.execute.after hook */
+  abortedChildren?: Set<string>
 }
 
 const DEDUP_MAX_SIZE = 10_000
@@ -94,6 +98,35 @@ export async function handleReactiveEvent(
   if (!shouldIntervene(attempt, ctx.maxRetries)) {
     ctx.logger.debug("reactive.retry_gate", { sessionID, attempt, maxRetries: ctx.maxRetries })
     ctx.handledRetrySessions.delete(sessionID)
+    return
+  }
+
+  // 子会话分支：abort-only，不走 revert+prompt
+  // 原因：revert 会删除消息导致 lastAssistant 读不到最新 assistant 消息，
+  //       prompt 会创建新 messageID 打断 task 工具的内部链路。
+  //       只 abort → onInterrupt → lastAssistant → task 正常返回。
+  if (ctx.childSessions?.has(sessionID)) {
+    // Record failure using the cache stack directly (lastUserMessageID not available yet)
+    const stack = ctx.messageCache.get(sessionID)
+    if (stack && stack.length > 0) {
+      const lastEntry = stack[stack.length - 1]
+      ctx.store.recordFailure(lastEntry.modelKey)
+      ctx.logger.info("reactive.child_failure_recorded", {
+        sessionID,
+        model: lastEntry.modelKey,
+        score: ctx.store.get(lastEntry.modelKey),
+        category: classification.category,
+      })
+    }
+    // Abort without revert/prompt — onInterrupt handles cleanup
+    ctx.abortedChildren?.add(sessionID)
+    try {
+      await ctx.client.session.abort({ path: { id: sessionID } })
+    } catch (err) {
+      ctx.logger.error("reactive.child_abort_failed", { sessionID, error: String(err) })
+      return
+    }
+    ctx.logger.info("reactive.child_aborted", { sessionID })
     return
   }
 
