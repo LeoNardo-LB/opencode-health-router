@@ -120,7 +120,12 @@ describe.skipIf(shouldSkip)("E2E: opencode serve + Mock LLM", () => {
       JSON.stringify(healthRouterConfig, null, 2),
     )
 
-    // 6. Start opencode serve (NO XDG overrides — use default global config + plugin discovery)
+    // 6. Start opencode serve
+    // Only override XDG_DATA_HOME (database isolation).
+    // Do NOT override XDG_CACHE_HOME — @ai-sdk/openai-compatible lives in
+    // ~/.cache/opencode/node_modules/ and must be found by the serve process.
+    // Do NOT override XDG_CONFIG_HOME — global opencode config at
+    // ~/.config/opencode/opencode.jsonc provides the plugin entry.
     serveStderr = []
     serveProcess = spawn(
       OPENCODE_BIN,
@@ -128,9 +133,8 @@ describe.skipIf(shouldSkip)("E2E: opencode serve + Mock LLM", () => {
       {
         env: {
           ...process.env,
-          // Override XDG_DATA_HOME and XDG_CACHE_HOME to isolate from real data
           XDG_DATA_HOME: path.join(tmpDir, "data"),
-          XDG_CACHE_HOME: path.join(tmpDir, "cache"),
+          // DEBUG_HEALTH_ROUTER: "true",
         },
         cwd: tmpDir,
         stdio: ["pipe", "pipe", "pipe"],
@@ -140,16 +144,27 @@ describe.skipIf(shouldSkip)("E2E: opencode serve + Mock LLM", () => {
       serveStderr.push(data.toString())
     })
 
-    // 7. Wait for serve to be ready (poll /api/session)
+    // 7. Wait for serve to be ready (poll /api/session — returns JSON quickly without bootstrapping)
     const start = Date.now()
     while (Date.now() - start < 30_000) {
       try {
-        const res = await fetch(`http://127.0.0.1:${servePort}/api/session`)
+        const res = await fetch(`http://127.0.0.1:${servePort}/api/session`, {
+          signal: AbortSignal.timeout(5_000),
+        })
         if (res.ok || res.status === 200) break
       } catch {
         /* not ready yet */
       }
       await new Promise((r) => setTimeout(r, 500))
+    }
+    // Verify serve actually started
+    const alive = (await fetch(`http://127.0.0.1:${servePort}/api/session`, {
+      signal: AbortSignal.timeout(3_000),
+    }).catch(() => null)) !== null
+    if (!alive) {
+      // Dump stderr for debugging
+      const stderrTail = serveStderr.slice(-20).join("\n")
+      throw new Error(`opencode serve failed to start!\nStderr (last 20 lines):\n${stderrTail}`)
     }
     // Extra wait for plugin to initialize (lazy-loaded on first session creation)
     await new Promise((r) => setTimeout(r, 2_000))
