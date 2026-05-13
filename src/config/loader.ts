@@ -113,8 +113,11 @@ export function loadConfig(logger: Logger, workdir: string | undefined, configDi
       const opencodeConfig = parseJSONC(opencodeRaw)
       const primarySet = new Set<ModelKey>()
       if (opencodeConfig && typeof opencodeConfig === "object" && "agent" in opencodeConfig && typeof opencodeConfig.agent === "object" && opencodeConfig.agent !== null) {
-        for (const cfg of Object.values(opencodeConfig.agent as Record<string, { model?: string }>)) {
-          if (cfg?.model && typeof cfg.model === "string") primarySet.add(cfg.model)
+        for (const [name, cfg] of Object.entries(opencodeConfig.agent as Record<string, { model?: string }>)) {
+          if (cfg?.model && typeof cfg.model === "string") {
+            primarySet.add(cfg.model)
+            config.agentModels[name] = cfg.model
+          }
         }
       }
       config.primaryModels = primarySet

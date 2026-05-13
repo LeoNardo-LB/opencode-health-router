@@ -41,5 +41,6 @@ export const DEFAULT_CONFIG: Config = {
   retryPolicy: { maxRetries: DEFAULT_MAX_RETRIES },
   agents: { "*": { fallbackModels: [] } },
   primaryModels: new Set(),
+  agentModels: {},
   logging: { level: DEFAULT_LOG_LEVEL, path: "" },
 }

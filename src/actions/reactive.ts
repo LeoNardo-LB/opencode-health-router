@@ -72,23 +72,28 @@ export async function handleReactiveEvent(
 
   ctx.logger.debug("reactive.retry_event", { sessionID, attempt, message: message.slice(0, 100) })
 
-  // ⓪ Anti-cascading: if this session's retry cycle was already handled, skip
-  // (prevents abort+revert+prompt waterfall from subsequent retry events)
+  // ⓪ Anti-cascading: atomic check-and-set BEFORE any await
+  // Moving add() here closes the race window — concurrent retry events will see
+  // the flag and return immediately.  Non-abort early-return paths delete the
+  // flag so that subsequent retry events get a chance to handle.
   if (ctx.handledRetrySessions.has(sessionID)) {
     ctx.logger.debug("reactive.already_handled", { sessionID, attempt })
     return
   }
+  ctx.handledRetrySessions.add(sessionID)
 
   // ① Classify
   const classification = classify(message, ctx.rules)
   if (!classification) {
     ctx.logger.debug("reactive.classify_miss", { sessionID, message: message.slice(0, 100) })
+    ctx.handledRetrySessions.delete(sessionID)
     return
   }
 
   // ② Retry gate
   if (!shouldIntervene(attempt, ctx.maxRetries)) {
     ctx.logger.debug("reactive.retry_gate", { sessionID, attempt, maxRetries: ctx.maxRetries })
+    ctx.handledRetrySessions.delete(sessionID)
     return
   }
 
@@ -105,6 +110,7 @@ export async function handleReactiveEvent(
     ctx.logger.debug("reactive.messages_ok", { sessionID, count: entries.length, parts: promptParts.length, lastUserMessageID })
   } catch (err) {
     ctx.logger.error("reactive.messages_failed", { sessionID, error: String(err) })
+    ctx.handledRetrySessions.delete(sessionID)
     return
   }
 
@@ -115,14 +121,34 @@ export async function handleReactiveEvent(
 
   if (!lastUserMessageID) {
     ctx.logger.warn("reactive.no_last_user_message", { sessionID })
+    ctx.handledRetrySessions.delete(sessionID)
     return
   }
 
   // ④ Find matching cache entry by messageID (stack lookup)
   const stack = ctx.messageCache.get(sessionID)
-  const cachedIdx = stack?.findIndex(e => e.messageID === lastUserMessageID)
+  let cachedIdx = stack?.findIndex(e => e.messageID === lastUserMessageID)
+
+  // Headless 模式 fallback：当 chat.message hook 收到 null messageID 时，
+  // cache entry 以空字符串存储。精确匹配失败后，只在 stack 最后一项
+  // 的 messageID 为空字符串（headless 标记）时才 fallback 匹配。
+  if ((cachedIdx === undefined || cachedIdx === -1) && stack && stack.length > 0) {
+    const lastEntry = stack[stack.length - 1]
+    if (lastEntry.messageID === "") {
+      cachedIdx = stack.length - 1
+      ctx.logger.debug("reactive.cache_fallback_match", {
+        sessionID,
+        lastUserMessageID,
+        matchedModel: lastEntry.modelKey,
+        matchedAgent: lastEntry.agentName,
+        stackSize: stack.length,
+      })
+    }
+  }
+
   if (cachedIdx === undefined || cachedIdx === -1 || !stack) {
     ctx.logger.warn("reactive.no_cache_match", { sessionID, lastUserMessageID, stackSize: stack?.length ?? 0 })
+    ctx.handledRetrySessions.delete(sessionID)
     return
   }
   const cached = stack[cachedIdx]
@@ -138,6 +164,7 @@ export async function handleReactiveEvent(
   const dedupKey = `${sessionID}:${lastUserMessageID}:${attempt}`
   if (ctx.dedupSet.has(dedupKey)) {
     ctx.logger.debug("reactive.dedup_hit", { sessionID, lastUserMessageID, attempt })
+    ctx.handledRetrySessions.delete(sessionID)
     return
   }
   ctx.dedupSet.add(dedupKey)
@@ -193,6 +220,7 @@ export async function handleReactiveEvent(
     if (ctx.client.tui) {
       try { await ctx.client.tui.showToast({ body: { message: "所有 fallback 模型已耗尽", variant: "error" } }) } catch { /* ignore */ }
     }
+    ctx.handledRetrySessions.delete(sessionID)
     return
   }
 
@@ -203,6 +231,7 @@ export async function handleReactiveEvent(
     if (ctx.client.tui) {
       try { await ctx.client.tui.showToast({ body: { message: `${currentModelKey} 无其他可用 fallback`, variant: "warning" } }) } catch { /* ignore */ }
     }
+    ctx.handledRetrySessions.delete(sessionID)
     return
   }
 
@@ -211,16 +240,15 @@ export async function handleReactiveEvent(
     await ctx.client.session.abort({ path: { id: sessionID } })
   } catch (err) {
     ctx.logger.error("reactive.abort_failed", { sessionID, error: String(err) })
+    ctx.handledRetrySessions.delete(sessionID)
     return
   }
 
-  // Anti-cascading: mark immediately after abort succeeds.
+  // Anti-cascading: flag was set at function entry (before all awaits).
   // abort() is irreversible — the fallback chain is now executing, so subsequent
   // retry events for this session must be skipped to avoid a waterfall of
-  // abort+revert+prompt calls.  Moving this BEFORE prompt() is critical because
-  // prompt() is async; without this, a retry event arriving mid-prompt would not
-  // see the flag and trigger a duplicate fallback cycle.
-  ctx.handledRetrySessions.add(sessionID)
+  // abort+revert+prompt calls.  The flag stays set until chat.message hook
+  // (user or plugin-prompt branch) clears it.
 
   try {
     await ctx.client.session.revert({
@@ -258,8 +286,9 @@ export async function handleReactiveEvent(
       } catch { /* tui might not be available */ }
     }
   } catch (err) {
-    // Failure: chat.message won't trigger, manually clean marker to prevent residue
+    // Failure: chat.message won't trigger, manually clean markers to prevent residue
     ctx.pluginPromptedSessions.delete(sessionID)
+    ctx.handledRetrySessions.delete(sessionID)  // Unlock — allow retry after prompt failure
     ctx.logger.error("reactive.prompt_failed", { sessionID, nextKey, error: String(err) })
   }
 }

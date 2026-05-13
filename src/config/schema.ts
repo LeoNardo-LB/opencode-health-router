@@ -78,6 +78,7 @@ export function validate(raw: unknown): { config: Config; warnings: string[] } {
     retryPolicy: parsed.retryPolicy,
     agents: parsed.agents,
     primaryModels: new Set(),
+    agentModels: {},
     logging: parsed.logging,
   }
 

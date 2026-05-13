@@ -60,6 +60,8 @@ export interface Config {
   retryPolicy: RetryPolicyConfig
   agents: Record<string, AgentChainConfig>
   primaryModels: Set<ModelKey>
+  /** agent name → default model key (extracted from opencode.jsonc agent configs) */
+  agentModels: Record<string, ModelKey>
   logging: LoggingConfig
 }
 

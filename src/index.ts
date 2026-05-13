@@ -131,11 +131,25 @@ export default {
       // Cache for reactive handler — ALL messages must be cached before any branching
       // so that fallback-to-fallback chains work (the plugin-prompted message also needs
       // a cache entry in case the fallback model also fails and triggers another retry).
-      if (input.model?.providerID && input.model?.modelID && input.messageID) {
+      //
+      // In headless/CLI mode (opencode run), input.model may be null.
+      // Fall back to the agent's default model from opencode.jsonc config.
+      const agentName = input.agent || "*"
+      let modelKey: string | undefined
+      if (input.model?.providerID && input.model?.modelID) {
+        modelKey = `${input.model.providerID}/${input.model.modelID}`
+      } else if (config.agentModels[agentName]) {
+        modelKey = config.agentModels[agentName]
+        logger.debug("preemptive.model_resolved_from_agent", { sessionID, agentName, modelKey })
+      }
+      if (modelKey) {
+        // headless/CLI 模式下 input.messageID 可能为 null，
+        // 用空字符串作为标记，reactive handler 会通过 fallback 查找匹配
+        const cacheMessageID = input.messageID || ""
         const entry = {
-          modelKey: `${input.model.providerID}/${input.model.modelID}`,
-          agentName: input.agent || "*",
-          messageID: input.messageID,
+          modelKey,
+          agentName,
+          messageID: cacheMessageID,
         }
         const stack = messageCache.get(sessionID)
         if (stack) {
@@ -143,11 +157,21 @@ export default {
         } else {
           messageCache.set(sessionID, [entry])
         }
+        if (!input.messageID) {
+          logger.debug("preemptive.cached_without_messageID", { sessionID, agentName, modelKey })
+        }
+      } else if (!modelKey) {
+        logger.warn("preemptive.no_model", { sessionID, agentName, hasMessageID: !!input.messageID })
       }
 
       // All messages → health score check (no trust branch)
       if (pluginPromptedSessions.has(sessionID)) {
         pluginPromptedSessions.delete(sessionID)
+        // V1 fix: also clear handledRetrySessions on plugin-prompt branch so that
+        // fallback-to-fallback chains are not blocked.  The fallback request has
+        // already started a new message cycle — if it also fails, the new retry
+        // event must be allowed to trigger the next fallback.
+        handledRetrySessions.delete(sessionID)
         logger.debug("preemptive.plugin_prompt", { sessionID, model: input.model ? `${input.model.providerID}/${input.model.modelID}` : null })
       } else {
         // New user message: reset anti-cascading flag so next retry cycle can be handled
