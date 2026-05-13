@@ -1,0 +1,265 @@
+import type { ModelKey } from "../types.js"
+import type { HealthStore } from "../health/store.js"
+import type { ModelSelector } from "../selection/selector.js"
+import type { Logger } from "../logging/logger.js"
+import { classify } from "../classification/classifier.js"
+import { shouldIntervene } from "../retry/policy.js"
+import { splitModelKey } from "../types.js"
+import type { ClassificationRule } from "../types.js"
+
+interface OpencodeClient {
+  session: {
+    abort(params: { path: { id: string } }): Promise<unknown>
+    revert(params: { path: { id: string }; body: { messageID: string } }): Promise<unknown>
+    prompt(params: {
+      path: { id: string }
+      body: { model: { providerID: string; modelID: string }; agent?: string; parts: unknown[] }
+    }): Promise<unknown>
+    messages(params: { path: { id: string } }): Promise<{ data?: Array<{
+      info: { id: string; role: string; model?: { providerID: string; modelID: string }; agent?: string }
+      parts: unknown[]
+    }> }>
+  }
+  tui?: { showToast(params: { body: { message: string; variant?: string } }): Promise<boolean> }
+}
+
+interface ReactiveContext {
+  client: OpencodeClient
+  store: HealthStore
+  selector: ModelSelector
+  rules: ClassificationRule[]
+  maxRetries: number
+  logger: Logger
+  dedupSet: Set<string>
+  pluginPromptedSessions: Set<string>
+  messageCache: Map<string, Array<{ modelKey: string; agentName: string; messageID: string }>>
+  /** Anti-cascading: prevents re-processing retry events after a fallback chain has already executed */
+  handledRetrySessions: Set<string>
+}
+
+const DEDUP_MAX_SIZE = 10_000
+
+/** 清理指定 sessionID 的所有去重键 (spec §8.3: session.deleted/compacted 事件触发) */
+export function cleanupDedupForSession(dedupSet: Set<string>, sessionID: string): void {
+  const prefix = `${sessionID}:`
+  for (const key of dedupSet) {
+    if (key.startsWith(prefix)) dedupSet.delete(key)
+  }
+}
+
+/** 容量上限清理：超出 10000 条时清理最旧 50% (spec §8.3) */
+export function cleanupDedupBySize(dedupSet: Set<string>): void {
+  if (dedupSet.size <= DEDUP_MAX_SIZE) return
+  const toDelete = Math.ceil(dedupSet.size * 0.5)
+  let count = 0
+  for (const key of dedupSet) {
+    if (count >= toDelete) break
+    dedupSet.delete(key)
+    count++
+  }
+}
+
+export async function handleReactiveEvent(
+  event: { type: string; properties?: { status?: { type?: string; attempt?: number; message?: string }; sessionID?: string } },
+  ctx: ReactiveContext,
+): Promise<void> {
+  if (!event || event.type !== "session.status") return
+  const status = event.properties?.status
+  if (status?.type !== "retry") return
+
+  const { attempt = 1, message = "", sessionID } = { ...status, sessionID: event.properties?.sessionID ?? "" }
+  if (!sessionID) return
+
+  ctx.logger.debug("reactive.retry_event", { sessionID, attempt, message: message.slice(0, 100) })
+
+  // ⓪ Anti-cascading: if this session's retry cycle was already handled, skip
+  // (prevents abort+revert+prompt waterfall from subsequent retry events)
+  if (ctx.handledRetrySessions.has(sessionID)) {
+    ctx.logger.debug("reactive.already_handled", { sessionID, attempt })
+    return
+  }
+
+  // ① Classify
+  const classification = classify(message, ctx.rules)
+  if (!classification) {
+    ctx.logger.debug("reactive.classify_miss", { sessionID, message: message.slice(0, 100) })
+    return
+  }
+
+  // ② Retry gate
+  if (!shouldIntervene(attempt, ctx.maxRetries)) {
+    ctx.logger.debug("reactive.retry_gate", { sessionID, attempt, maxRetries: ctx.maxRetries })
+    return
+  }
+
+  // ③ Get last user message from messages API (needed for messageID + parts)
+  let promptParts: unknown[]
+  let lastUserMessageID: string | undefined
+  try {
+    const result = await ctx.client.session.messages({ path: { id: sessionID } })
+    const entries: any[] = Array.isArray((result as any).data) ? (result as any).data : []
+    const lastUser = [...entries].reverse().find((e) => e?.info?.role === "user")
+    promptParts = lastUser?.parts ?? []
+    lastUserMessageID = lastUser?.info?.id
+    if (!Array.isArray(promptParts)) promptParts = []
+    ctx.logger.debug("reactive.messages_ok", { sessionID, count: entries.length, parts: promptParts.length, lastUserMessageID })
+  } catch (err) {
+    ctx.logger.error("reactive.messages_failed", { sessionID, error: String(err) })
+    return
+  }
+
+  if (promptParts.length === 0) {
+    promptParts = [{ type: "text", text: "" }]
+    ctx.logger.warn("reactive.empty_parts", { sessionID })
+  }
+
+  if (!lastUserMessageID) {
+    ctx.logger.warn("reactive.no_last_user_message", { sessionID })
+    return
+  }
+
+  // ④ Find matching cache entry by messageID (stack lookup)
+  const stack = ctx.messageCache.get(sessionID)
+  const cachedIdx = stack?.findIndex(e => e.messageID === lastUserMessageID)
+  if (cachedIdx === undefined || cachedIdx === -1 || !stack) {
+    ctx.logger.warn("reactive.no_cache_match", { sessionID, lastUserMessageID, stackSize: stack?.length ?? 0 })
+    return
+  }
+  const cached = stack[cachedIdx]
+  // Remove consumed entry from stack to prevent memory leak
+  stack.splice(cachedIdx, 1)
+  if (stack.length === 0) ctx.messageCache.delete(sessionID)
+
+  const currentModelKey: ModelKey = cached.modelKey
+  const agentName = cached.agentName
+  const userMessageID = cached.messageID
+
+  // ⑤ Dedup (includes messageID to avoid cross-message collision)
+  const dedupKey = `${sessionID}:${lastUserMessageID}:${attempt}`
+  if (ctx.dedupSet.has(dedupKey)) {
+    ctx.logger.debug("reactive.dedup_hit", { sessionID, lastUserMessageID, attempt })
+    return
+  }
+  ctx.dedupSet.add(dedupKey)
+
+  // ⑥ Record failure
+  ctx.store.recordFailure(currentModelKey)
+  ctx.logger.info("reactive.failure_recorded", {
+    sessionID,
+    model: currentModelKey,
+    score: ctx.store.get(currentModelKey),
+    category: classification.category,
+  })
+  let excludedProvider: string | undefined
+
+  switch (classification.category) {
+    case "5xx": {
+      // 服务端错误：立即切换，不等待 OpenCode 再重试其他 server
+      ctx.logger.debug("reactive.category_branch", { sessionID, category: "5xx", action: "immediate" })
+      // 扣分加重？TODO: 可考虑 failurePenalty * 1.5
+      break
+    }
+    case "overloaded": {
+      // 服务过载：当前模型短暂不可用，正常扣分
+      ctx.logger.debug("reactive.category_branch", { sessionID, category: "overloaded", action: "normal" })
+      break
+    }
+    case "rate_limit": {
+      // 频率限制：当前模型请求太密，正常扣分
+      ctx.logger.debug("reactive.category_branch", { sessionID, category: "rate_limit", action: "normal" })
+      break
+    }
+    case "quota_exceeded": {
+      // 配额耗尽：同厂商模型全部不可用，需要过滤
+      excludedProvider = splitModelKey(currentModelKey).providerID
+      ctx.logger.debug("reactive.category_branch", { sessionID, category: "quota_exceeded", action: "exclude_provider", excludedProvider })
+      break
+    }
+    case "timeout": {
+      // 超时：可能网络波动，正常扣分
+      ctx.logger.debug("reactive.category_branch", { sessionID, category: "timeout", action: "normal" })
+      break
+    }
+    default: {
+      ctx.logger.debug("reactive.category_branch", { sessionID, category: classification.category, action: "unknown" })
+      break
+    }
+  }
+
+  // ⑦ Select fallback
+  const nextKey = ctx.selector.resolve(agentName, excludedProvider ? { excludeProvider: excludedProvider } : undefined)
+  if (!nextKey) {
+    ctx.logger.warn("reactive.chain_exhausted", { sessionID, agentName })
+    if (ctx.client.tui) {
+      try { await ctx.client.tui.showToast({ body: { message: "所有 fallback 模型已耗尽", variant: "error" } }) } catch { /* ignore */ }
+    }
+    return
+  }
+
+  // Avoid switching to the same model that just failed
+  if (nextKey === currentModelKey) {
+    ctx.logger.warn("reactive.same_model", { sessionID, model: currentModelKey })
+    ctx.pluginPromptedSessions.delete(sessionID)
+    if (ctx.client.tui) {
+      try { await ctx.client.tui.showToast({ body: { message: `${currentModelKey} 无其他可用 fallback`, variant: "warning" } }) } catch { /* ignore */ }
+    }
+    return
+  }
+
+  // ⑧ Execute switch
+  try {
+    await ctx.client.session.abort({ path: { id: sessionID } })
+  } catch (err) {
+    ctx.logger.error("reactive.abort_failed", { sessionID, error: String(err) })
+    return
+  }
+
+  // Anti-cascading: mark immediately after abort succeeds.
+  // abort() is irreversible — the fallback chain is now executing, so subsequent
+  // retry events for this session must be skipped to avoid a waterfall of
+  // abort+revert+prompt calls.  Moving this BEFORE prompt() is critical because
+  // prompt() is async; without this, a retry event arriving mid-prompt would not
+  // see the flag and trigger a duplicate fallback cycle.
+  ctx.handledRetrySessions.add(sessionID)
+
+  try {
+    await ctx.client.session.revert({
+      path: { id: sessionID },
+      body: { messageID: userMessageID },
+    })
+  } catch (err) {
+    // 跳过 revert，对话历史可能残留失败回复，但不阻断 (spec §5.7/§8.2)
+    ctx.logger.warn("reactive.revert_skipped", { sessionID, error: String(err) })
+  }
+
+  const { providerID, modelID } = splitModelKey(nextKey)
+
+  // Mark as plugin-triggered prompt so chat.message uses score mechanism
+  ctx.pluginPromptedSessions.add(sessionID)
+  try {
+    await ctx.client.session.prompt({
+      path: { id: sessionID },
+      body: {
+        model: { providerID, modelID },
+        parts: promptParts,
+      },
+    })
+    // Success: chat.message hook will consume and clean the marker
+    ctx.logger.info("reactive.fallback_success", {
+      sessionID,
+      from: currentModelKey,
+      to: nextKey,
+      agent: agentName,
+    })
+
+    if (ctx.client.tui) {
+      try {
+        await ctx.client.tui.showToast({ body: { message: `${currentModelKey} ${classification.category} → ${nextKey}`, variant: "warning" } })
+      } catch { /* tui might not be available */ }
+    }
+  } catch (err) {
+    // Failure: chat.message won't trigger, manually clean marker to prevent residue
+    ctx.pluginPromptedSessions.delete(sessionID)
+    ctx.logger.error("reactive.prompt_failed", { sessionID, nextKey, error: String(err) })
+  }
+}

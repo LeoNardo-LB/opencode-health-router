@@ -1,0 +1,26 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "agent": {
+    "build": {
+      "model": "zhipuai-coding-plan/glm-5.1",
+      "fallback_models": ["deepseek/deepseek-v4-pro"],
+      "temperature": 0.2,
+      "mode": "primary"
+    },
+    "plan": {
+      "model": "zhipuai-coding-plan/glm-5.1",
+      "fallback_models": ["deepseek/deepseek-v4-pro"],
+      "mode": "primary"
+    },
+    "general": {
+      "model": "zhipuai-coding-plan/glm-5-turbo",
+      "fallback_models": ["deepseek/deepseek-v4-flash"],
+      "mode": "subagent"
+    },
+    "explore": {
+      "model": "zhipuai-coding-plan/glm-4.7",
+      "fallback_models": ["deepseek/deepseek-v4-flash"],
+      "mode": "subagent"
+    }
+  }
+}

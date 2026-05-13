@@ -1,0 +1,8 @@
+{
+  "enabled": true,
+  "retryPolicy": { "maxRetries": 3 },
+  "agents": {
+    "build": { "fallbackModels": ["deepseek/deepseek-v4-pro"] },
+    "*": { "fallbackModels": ["deepseek/deepseek-v4-flash"] }
+  }
+}
