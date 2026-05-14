@@ -216,9 +216,11 @@ if (!sharedStore) sharedStore = new HealthStore(config)
 | abort 后不再有 retry | ✅ | 会话状态变为 Idle，OpenCode 停止重试 |
 | tool.execute.after 的 abortedChildren 去重 | ✅ | 检查 + delete 确保只增强一次 |
 
-**注意**：`handledRetrySessions` 在函数入口 add，子会话路径不 delete。
-这意味着同一 retry 周期只处理一次。后续 retry events 会被 `already_handled` 短路。
-✅ 正确行为。
+**注意**：`handledRetrySessions` 在函数入口 add，行为按 abort 结果分流：
+- **abort 成功**：不 delete（anti-cascading，abort 不可逆，后续 retry 应被短路）→ 依赖 `session.deleted` 清理
+- **abort 失败**：delete（允许后续 retry 事件重新尝试处理，避免瞬态故障永久阻断）
+
+后续 retry events 会被 `already_handled` 短路。✅ 正确行为。
 
 ---
 
@@ -256,9 +258,10 @@ abort() → onInterrupt → task promise resolve → tool execute 完成 → hoo
 
 ### 问题 5: abortedChildren Set 的内存泄漏
 
-`sharedAbortedChildren` 理论上会在 `tool.execute.after` 中 `delete`，但如果 task 因其他原因未触发 hook（极少情况），会导致内存泄漏。
+`abortedChildren.add()` 仅在 abort 成功后执行（已修复：原实现 add 在 abort 之前，abort 失败时产生幽灵条目）。
+正常流程下 `tool.execute.after` 会 consume 并 delete。如果 task 因其他原因未触发 hook（极少情况），会导致残留。
 
-**缓解**：在 tick timer 的定期清理中同步清理过期的 aborted children。
+**缓解**：`session.deleted` 事件兜底清理（index.ts）。
 
 ---
 

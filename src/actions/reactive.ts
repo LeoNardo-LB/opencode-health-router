@@ -118,15 +118,26 @@ export async function handleReactiveEvent(
         category: classification.category,
       })
     }
-    // Abort without revert/prompt — onInterrupt handles cleanup
-    ctx.abortedChildren?.add(sessionID)
+    // Abort without revert/prompt — onInterrupt handles cleanup.
+    // abortedChildren.add() and cache cleanup are deferred until abort succeeds
+    // to prevent phantom entries and ensure retry-after-abort-failure has data.
     try {
       await ctx.client.session.abort({ path: { id: sessionID } })
+      ctx.abortedChildren?.add(sessionID)
+      // Consume cache entry to prevent memory leak (mirrors main-session splice)
+      if (stack && stack.length > 0) {
+        stack.pop()
+        if (stack.length === 0) ctx.messageCache.delete(sessionID)
+      }
+      ctx.logger.info("reactive.child_aborted", { sessionID })
     } catch (err) {
       ctx.logger.error("reactive.child_abort_failed", { sessionID, error: String(err) })
+      // Clean up anti-cascading flag so future retry events can be processed.
+      // Without this, a transient abort failure permanently suppresses all
+      // retry handling for this session.
+      ctx.handledRetrySessions.delete(sessionID)
       return
     }
-    ctx.logger.info("reactive.child_aborted", { sessionID })
     return
   }
 

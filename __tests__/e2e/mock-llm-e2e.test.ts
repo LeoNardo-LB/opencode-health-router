@@ -301,13 +301,60 @@ describe.skipIf(shouldSkip)("E2E: opencode serve + Mock LLM", () => {
     await new Promise((r) => setTimeout(r, 20_000))
 
     // Verify: primary was called (429 responses)
-    console.log("Primary calls:", primaryServer.getCallCount())
-    console.log("Fallback calls:", fallbackServer.getCallCount())
+    const primaryCalls = primaryServer.getCallCount()
+    const fallbackCalls = fallbackServer.getCallCount()
+    console.log("Primary calls:", primaryCalls)
+    console.log("Fallback calls:", fallbackCalls)
 
-    // Verify: log shows reactive handler activity
+    // Hard assertion: primary received at least one request
+    expect(primaryCalls).toBeGreaterThanOrEqual(1)
+
+    // --- Verify tool.execute.after output enhancement ---
+    // Read parent session messages to check if task output contains 429 context
+    try {
+      const messagesRes = await fetch(
+        `http://127.0.0.1:${servePort}/session/${parentSessionID}/message${dirParam}`,
+        { signal: AbortSignal.timeout(5_000) },
+      )
+      if (messagesRes.ok) {
+        const messagesData = await messagesRes.json()
+        const messages = Array.isArray(messagesData) ? messagesData : (messagesData.data ?? [])
+        // Find assistant messages that might contain the task tool result
+        const allText = messages
+          .filter((m: any) => m.info?.role === "assistant")
+          .map((m: any) => {
+            // Extract text from parts
+            const parts = m.parts ?? []
+            return parts
+              .filter((p: any) => p.type === "text")
+              .map((p: any) => p.text ?? "")
+              .join("\n")
+          })
+          .join("\n")
+
+        const hasEnhancedOutput =
+          allText.includes("429") ||
+          allText.includes("限流") ||
+          allText.includes("opencode export")
+        console.log("E2E child test — tool.execute.after output enhanced:", hasEnhancedOutput)
+        console.log("E2E child test — assistant text length:", allText.length)
+
+        // Soft-check: if the plugin fully initialized, the output should be enhanced.
+        // If not (e.g. plugin lazy-load timing), this is informational — the hard
+        // assertion above (primaryCalls >= 1) already proves the mock was hit.
+        if (!hasEnhancedOutput && allText.length > 0) {
+          console.log("E2E child test — sample assistant text:", allText.slice(0, 500))
+        }
+      } else {
+        console.log("E2E child test — messages API returned:", messagesRes.status)
+      }
+    } catch (err) {
+      console.log("E2E child test — could not read messages:", String(err))
+    }
+
+    // --- Verify plugin log shows child abort activity ---
     const logPath = path.join(tmpDir, "health-router.log")
     const logContent = await readFile(logPath, "utf-8").catch(() => "")
-
     const reactiveLines = logContent.split("\n").filter(l =>
       l.includes("reactive") || l.includes("child") || l.includes("429")
     )
@@ -316,7 +363,18 @@ describe.skipIf(shouldSkip)("E2E: opencode serve + Mock LLM", () => {
       console.log("Sample:", reactiveLines.slice(0, 5))
     }
 
-    // Primary should have been called at least once
-    expect(primaryServer.getCallCount()).toBeGreaterThanOrEqual(1)
+    // Write full diagnostics for post-mortem analysis
+    const diagPath = path.join(os.tmpdir(), `e2e-child-test-diag-${Date.now()}.log`)
+    await writeFile(diagPath, [
+      `Primary calls: ${primaryCalls}`,
+      `Fallback calls: ${fallbackCalls}`,
+      `Primary call log: ${JSON.stringify(primaryServer.getCallLog())}`,
+      `Fallback call log: ${JSON.stringify(fallbackServer.getCallLog())}`,
+      `Plugin log lines: ${reactiveLines.length}`,
+      `--- Serve stderr (last 20) ---`,
+      ...serveStderr.slice(-20),
+      `--- Plugin log ---`,
+      logContent.slice(-2000),
+    ].join("\n")).catch(() => {})
   }, TIMEOUT_MS)
 })

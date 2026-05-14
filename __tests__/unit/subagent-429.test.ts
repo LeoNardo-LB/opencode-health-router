@@ -388,6 +388,58 @@ describe("Subagent 429 recovery — child session abort-only", () => {
     // Still tracked
     expect(abortedChildren.has("child-s7")).toBe(true)
   })
+
+  it("child session: quota_exceeded → abort-only without excludeProvider processing", async () => {
+    const config = makeConfig()
+    // Setup: two models from same provider in fallback chain
+    config.agents = {
+      build: { fallbackModels: ["zhipuai/glm-5-turbo", "deepseek/v4-pro"] },
+    }
+    const store = new HealthStore(config)
+    store._set("zhipuai/glm-5.1", { score: 100, lastRecoveryAt: 0 })
+    store._set("zhipuai/glm-5-turbo", { score: 100, lastRecoveryAt: 0 })
+    store._set("deepseek/v4-pro", { score: 100, lastRecoveryAt: 0 })
+    const selector = new ModelSelector(config, store)
+    const logger = createLogger({ level: "error" })
+    const abortFn = vi.fn().mockResolvedValue(undefined)
+    const childSessions = new Set(["child-quota"])
+    const abortedChildren = new Set<string>()
+
+    const event = {
+      type: "session.status",
+      properties: {
+        sessionID: "child-quota",
+        status: { type: "retry", attempt: 4, message: "免费账户的 API 调用次数已用尽" },
+      },
+    }
+
+    await handleReactiveEvent(event, {
+      client: {
+        session: {
+          abort: abortFn,
+          revert: vi.fn(),
+          prompt: vi.fn(),
+          messages: vi.fn().mockResolvedValue({ data: [] }),
+        },
+      },
+      store, selector, rules: BUILTIN_RULES, maxRetries: 3,
+      logger, dedupSet: new Set(), pluginPromptedSessions: new Set(),
+      messageCache: new Map([["child-quota", [{ modelKey: "zhipuai/glm-5.1", agentName: "build", messageID: "m1" }]]]),
+      handledRetrySessions: new Set(),
+      childSessions,
+      abortedChildren,
+    })
+
+    // Child path: only abort, no model selection
+    expect(abortFn).toHaveBeenCalledOnce()
+    // Only the failed model's score drops (no excludeProvider cascade)
+    expect(store.get("zhipuai/glm-5.1")).toBe(80)
+    // Same-provider fallback model NOT affected (child path skips excludeProvider)
+    expect(store.get("zhipuai/glm-5-turbo")).toBe(100)
+    expect(store.get("deepseek/v4-pro")).toBe(100)
+    // AbortedChildren tracked (abort succeeded)
+    expect(abortedChildren.has("child-quota")).toBe(true)
+  })
 })
 
 // ─── P3: session.created handler ──────────────────────────────────────────
@@ -520,7 +572,7 @@ describe("Subagent 429 recovery — tool.execute.after hook (P5)", () => {
 // ─── P6: child abort error handling ───────────────────────────────────────
 
 describe("Subagent 429 recovery — child abort error handling", () => {
-  it("child session: abort() throws → logs error, no unhandled rejection", async () => {
+  it("child session: abort() throws → logs error, cleans up handledRetrySessions", async () => {
     const config = makeConfig()
     const store = new HealthStore(config)
     store._set("zhipuai/glm-5.1", { score: 100, lastRecoveryAt: 0 })
@@ -531,6 +583,7 @@ describe("Subagent 429 recovery — child abort error handling", () => {
     const promptFn = vi.fn().mockResolvedValue(undefined)
     const childSessions = new Set(["child-abort-err"])
     const abortedChildren = new Set<string>()
+    const handledRetrySessions = new Set<string>()
 
     const event = {
       type: "session.status",
@@ -553,7 +606,7 @@ describe("Subagent 429 recovery — child abort error handling", () => {
       store, selector, rules: BUILTIN_RULES, maxRetries: 3,
       logger, dedupSet: new Set(), pluginPromptedSessions: new Set(),
       messageCache: new Map([["child-abort-err", [{ modelKey: "zhipuai/glm-5.1", agentName: "build", messageID: "m1" }]]]),
-      handledRetrySessions: new Set(),
+      handledRetrySessions,
       childSessions,
       abortedChildren,
     })
@@ -564,14 +617,207 @@ describe("Subagent 429 recovery — child abort error handling", () => {
     // revert and prompt NOT called (child branch)
     expect(revertFn).not.toHaveBeenCalled()
     expect(promptFn).not.toHaveBeenCalled()
-    // abortedChildren still contains the sessionID (added before abort call)
-    expect(abortedChildren.has("child-abort-err")).toBe(true)
+    // abortedChildren should NOT contain the sessionID (abort failed — no phantom entry)
+    expect(abortedChildren.has("child-abort-err")).toBe(false)
     // Failure was still recorded (score penalty applied before abort attempt)
     expect(store.get("zhipuai/glm-5.1")).toBe(80)
+    // Anti-cascading flag cleaned up so future retry events can be processed
+    expect(handledRetrySessions.has("child-abort-err")).toBe(false)
+  })
+
+  it("child session: abort fails → retry event processed on second attempt", async () => {
+    const config = makeConfig()
+    const store = new HealthStore(config)
+    store._set("zhipuai/glm-5.1", { score: 100, lastRecoveryAt: 0 })
+    const selector = new ModelSelector(config, store)
+    const logger = createLogger({ level: "error" })
+    const childSessions = new Set(["child-retry"])
+    const abortedChildren = new Set<string>()
+    const handledRetrySessions = new Set<string>()
+
+    const ctx = {
+      client: {
+        session: {
+          // First call fails, second succeeds
+          abort: vi.fn()
+            .mockRejectedValueOnce(new Error("connection reset"))
+            .mockResolvedValueOnce(undefined),
+          revert: vi.fn().mockResolvedValue(undefined),
+          prompt: vi.fn().mockResolvedValue(undefined),
+          messages: vi.fn().mockResolvedValue({ data: [] }),
+        },
+      },
+      store, selector, rules: BUILTIN_RULES, maxRetries: 3,
+      logger, dedupSet: new Set(), pluginPromptedSessions: new Set(),
+      messageCache: new Map([["child-retry", [{ modelKey: "zhipuai/glm-5.1", agentName: "build", messageID: "m1" }]]]),
+      handledRetrySessions,
+      childSessions,
+      abortedChildren,
+    }
+
+    const event = {
+      type: "session.status",
+      properties: {
+        sessionID: "child-retry",
+        status: { type: "retry", attempt: 4, message: "429 Rate Limited" },
+      },
+    }
+
+    // First attempt: abort fails → handledRetrySessions cleaned
+    await handleReactiveEvent(event, ctx)
+    expect(ctx.client.session.abort).toHaveBeenCalledOnce()
+    expect(abortedChildren.has("child-retry")).toBe(false)
+    expect(handledRetrySessions.has("child-retry")).toBe(false)
+    // Score drops once: 100 → 80
+    expect(store.get("zhipuai/glm-5.1")).toBe(80)
+
+    // Reset score to test second attempt records another failure
+    store._set("zhipuai/glm-5.1", { score: 80, lastRecoveryAt: 0 })
+
+    // Second attempt: abort succeeds → full child path works
+    await handleReactiveEvent(event, ctx)
+    expect(ctx.client.session.abort).toHaveBeenCalledTimes(2)
+    expect(abortedChildren.has("child-retry")).toBe(true)
+    expect(store.get("zhipuai/glm-5.1")).toBe(60) // 80 - 20 = 60
   })
 })
 
-// ─── P7: tool.execute.after edge cases ─────────────────────────────────────
+// ─── P7: child cache consumption ─────────────────────────────────────────
+
+describe("Subagent 429 recovery — child cache consumption on abort", () => {
+  it("child abort success → messageCache entry consumed (popped)", async () => {
+    const config = makeConfig()
+    const store = new HealthStore(config)
+    store._set("zhipuai/glm-5.1", { score: 100, lastRecoveryAt: 0 })
+    const selector = new ModelSelector(config, store)
+    const logger = createLogger({ level: "error" })
+    const messageCache = new Map([
+      ["child-cache-1", [{ modelKey: "zhipuai/glm-5.1", agentName: "build", messageID: "m1" }]],
+    ])
+
+    await handleReactiveEvent(
+      {
+        type: "session.status",
+        properties: {
+          sessionID: "child-cache-1",
+          status: { type: "retry", attempt: 4, message: "429 Rate Limited" },
+        },
+      },
+      {
+        client: {
+          session: {
+            abort: vi.fn().mockResolvedValue(undefined),
+            revert: vi.fn().mockResolvedValue(undefined),
+            prompt: vi.fn().mockResolvedValue(undefined),
+            messages: vi.fn().mockResolvedValue({ data: [] }),
+          },
+        },
+        store, selector, rules: BUILTIN_RULES, maxRetries: 3,
+        logger, dedupSet: new Set(), pluginPromptedSessions: new Set(),
+        messageCache,
+        handledRetrySessions: new Set(),
+        childSessions: new Set(["child-cache-1"]),
+        abortedChildren: new Set(),
+      },
+    )
+
+    // Cache entry should be fully removed (stack became empty after pop)
+    expect(messageCache.has("child-cache-1")).toBe(false)
+  })
+
+  it("child abort success → multi-entry stack: only last entry consumed", async () => {
+    const config = makeConfig()
+    const store = new HealthStore(config)
+    store._set("zhipuai/glm-5.1", { score: 100, lastRecoveryAt: 0 })
+    const selector = new ModelSelector(config, store)
+    const logger = createLogger({ level: "error" })
+    const messageCache = new Map([
+      ["child-cache-multi", [
+        { modelKey: "deepseek/v4-pro", agentName: "build", messageID: "m-early" },
+        { modelKey: "zhipuai/glm-5.1", agentName: "build", messageID: "m-last" },
+      ]],
+    ])
+
+    await handleReactiveEvent(
+      {
+        type: "session.status",
+        properties: {
+          sessionID: "child-cache-multi",
+          status: { type: "retry", attempt: 4, message: "429 Rate Limited" },
+        },
+      },
+      {
+        client: {
+          session: {
+            abort: vi.fn().mockResolvedValue(undefined),
+            revert: vi.fn().mockResolvedValue(undefined),
+            prompt: vi.fn().mockResolvedValue(undefined),
+            messages: vi.fn().mockResolvedValue({ data: [] }),
+          },
+        },
+        store, selector, rules: BUILTIN_RULES, maxRetries: 3,
+        logger, dedupSet: new Set(), pluginPromptedSessions: new Set(),
+        messageCache,
+        handledRetrySessions: new Set(),
+        childSessions: new Set(["child-cache-multi"]),
+        abortedChildren: new Set(),
+      },
+    )
+
+    // Last entry consumed, first entry remains
+    expect(messageCache.has("child-cache-multi")).toBe(true)
+    const remaining = messageCache.get("child-cache-multi")!
+    expect(remaining.length).toBe(1)
+    expect(remaining[0].modelKey).toBe("deepseek/v4-pro")
+    // Failure recorded on the LAST entry's model
+    expect(store.get("zhipuai/glm-5.1")).toBe(80)
+  })
+
+  it("child abort failure → messageCache entry preserved for retry", async () => {
+    const config = makeConfig()
+    const store = new HealthStore(config)
+    store._set("zhipuai/glm-5.1", { score: 100, lastRecoveryAt: 0 })
+    const selector = new ModelSelector(config, store)
+    const logger = createLogger({ level: "error" })
+    const messageCache = new Map([
+      ["child-cache-fail", [{ modelKey: "zhipuai/glm-5.1", agentName: "build", messageID: "m1" }]],
+    ])
+
+    await handleReactiveEvent(
+      {
+        type: "session.status",
+        properties: {
+          sessionID: "child-cache-fail",
+          status: { type: "retry", attempt: 4, message: "429 Rate Limited" },
+        },
+      },
+      {
+        client: {
+          session: {
+            abort: vi.fn().mockRejectedValue(new Error("connection reset")),
+            revert: vi.fn().mockResolvedValue(undefined),
+            prompt: vi.fn().mockResolvedValue(undefined),
+            messages: vi.fn().mockResolvedValue({ data: [] }),
+          },
+        },
+        store, selector, rules: BUILTIN_RULES, maxRetries: 3,
+        logger, dedupSet: new Set(), pluginPromptedSessions: new Set(),
+        messageCache,
+        handledRetrySessions: new Set(),
+        childSessions: new Set(["child-cache-fail"]),
+        abortedChildren: new Set(),
+      },
+    )
+
+    // Cache entry should NOT be consumed — preserved for potential retry
+    expect(messageCache.has("child-cache-fail")).toBe(true)
+    const remaining = messageCache.get("child-cache-fail")!
+    expect(remaining.length).toBe(1)
+    expect(remaining[0].modelKey).toBe("zhipuai/glm-5.1")
+  })
+})
+
+// ─── P8: tool.execute.after edge cases ─────────────────────────────────────
 
 describe("Subagent 429 recovery — tool.execute.after edge cases", () => {
   it("task+aborted child with non-string output → converts to string", () => {
