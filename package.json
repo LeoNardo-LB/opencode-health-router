@@ -10,7 +10,7 @@
     "test:watch": "vitest",
     "test:e2e": "npm run build && vitest run --config vitest.e2e.config.ts __tests__/e2e/",
     "test:e2e:hook": "vitest run --config vitest.e2e.config.ts __tests__/e2e/plugin-lifecycle.test.ts",
-    "test:e2e:serve": "npm run build && vitest run --config vitest.e2e.config.ts __tests__/e2e/mock-llm-e2e.test.ts"
+    "test:e2e:serve": "npm run build && vitest run --config vitest.e2e.config.ts __tests__/e2e/mock-llm-e2e.test.ts __tests__/e2e/comprehensive-e2e.test.ts"
   },
   "dependencies": {
     "@opencode-ai/plugin": "^1.3.0",

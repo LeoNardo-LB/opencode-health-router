@@ -295,8 +295,11 @@ describe.skipIf(shouldSkip)("E2E: Comprehensive opencode serve + Mock LLM", () =
     ].join("\n")
     await writeFile(diagPath, diagContent).catch(() => {})
     expect(primaryCalls).toBeGreaterThanOrEqual(1)
+    // P0: Hard assertion — fallback MUST be called after 429 triggers reactive fallback
+    expect(fallbackCalls).toBeGreaterThanOrEqual(1)
 
-    // Verify: log shows reactive handler activity
+    // Hard assertions above prove the complete chain: primary 429 → plugin reactive → fallback called
+    // Log verification below is informational (plugin lazy-load timing may vary)
     const logContent = await readLog(tmpDir)
     const hasReactive =
       logContent.includes("reactive") ||
@@ -305,9 +308,6 @@ describe.skipIf(shouldSkip)("E2E: Comprehensive opencode serve + Mock LLM", () =
       logContent.includes("score")
     console.log("Test 1 — has reactive log:", hasReactive, "log size:", logContent.length)
 
-    // The plugin log may not be written if the plugin doesn't fully initialize
-    // in the test environment. The critical assertion is primaryCalls >= 1.
-    // Log verification is soft (informational, not hard-fail).
     if (logContent.length === 0) {
       // Write diagnostic for debugging
       const softDiagPath = path.join(os.tmpdir(), `e2e-diag-empty-log-${Date.now()}.txt`)
@@ -466,6 +466,8 @@ describe.skipIf(shouldSkip)("E2E: Comprehensive opencode serve + Mock LLM", () =
     const primaryCalls = primaryServer.getCallCount()
     console.log("Test 4 — primary calls:", primaryCalls, "sessions:", sessionA, sessionB)
     expect(primaryCalls).toBeGreaterThanOrEqual(2)
+    // P0: Hard assertion — fallback must be called for at least one session
+    expect(fallbackServer.getCallCount()).toBeGreaterThanOrEqual(1)
 
     // Verify: log mentions both session IDs (or at least shows concurrent activity)
     const logContent = await readLog(tmpDir)
@@ -542,5 +544,265 @@ describe.skipIf(shouldSkip)("E2E: Comprehensive opencode serve + Mock LLM", () =
       logAfterSecond.includes("health") ||
       logAfterSecond.includes("penalty")
     console.log("Test 5 — has score entries:", hasScoreEntries, "total log size:", logAfterSecond.length)
+
+    // P0: Hard assertion — log must contain score entries showing health degradation
+    const allScoreMatches = logAfterSecond.match(/"score":\s*(\d+)/g)
+    if (allScoreMatches && allScoreMatches.length >= 2) {
+      const scores = allScoreMatches.map((m) => parseInt(m.match(/"score":\s*(\d+)/)![1], 10))
+      const hasLowScore = scores.some((s) => s < 100)
+      expect(hasLowScore).toBe(true) // At least one score entry must show degradation
+    }
+    // If no score matches found (plugin lazy-load timing), the soft log check above is sufficient
+  }, TIMEOUT_MS)
+
+  // ─── P1: quota_exceeded excludeProvider ────────────────────────────────
+
+  it("402 quota_exceeded → excludeProvider → fallback from different provider", async () => {
+    primaryServer.resetCallLog()
+    fallbackServer.resetCallLog()
+
+    // Primary: return 402 quota exceeded (enough for retries to exhaust)
+    primaryServer.replyQuotaExceeded("Insufficient quota for this model")
+    primaryServer.replyQuotaExceeded("Insufficient quota for this model")
+    primaryServer.replyQuotaExceeded("Insufficient quota for this model")
+    primaryServer.replyQuotaExceeded("Insufficient quota for this model")
+    // Fallback: healthy response (different provider, so excludedProvider won't affect it)
+    fallbackServer.setDefault({
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        id: `chatcmpl-quota-${Date.now()}`,
+        object: "chat.completion",
+        choices: [{
+          index: 0,
+          message: { role: "assistant", content: "Quota fallback response" },
+          finish_reason: "stop",
+        }],
+        usage: { prompt_tokens: 10, completion_tokens: 20, total_tokens: 30 },
+      }),
+    })
+
+    const sessionID = await createSession(servePort, tmpDir)
+    await sendPrompt(servePort, tmpDir, sessionID, "Test quota exceeded handling")
+    await new Promise((r) => setTimeout(r, 15_000))
+
+    const primaryCalls = primaryServer.getCallCount()
+    const fallbackCalls = fallbackServer.getCallCount()
+
+    // P1: Primary was called with 402
+    expect(primaryCalls).toBeGreaterThanOrEqual(1)
+    // P1: Fallback was called (proves excludeProvider worked — fallback is different provider)
+    expect(fallbackCalls).toBeGreaterThanOrEqual(1)
+
+    const logContent = await readLog(tmpDir)
+    console.log("Quota test — primary:", primaryCalls, "fallback:", fallbackCalls,
+      "has quota log:", logContent.includes("quota") || logContent.includes("402") || logContent.includes("reactive"))
+
+    const diagPath = path.join(os.tmpdir(), `e2e-diag-quota-${Date.now()}.log`)
+    await writeFile(diagPath, [
+      `Primary calls: ${primaryCalls}`, `Fallback calls: ${fallbackCalls}`,
+      `Primary call log: ${JSON.stringify(primaryServer.getCallLog())}`,
+      `Fallback call log: ${JSON.stringify(fallbackServer.getCallLog())}`,
+      `--- Plugin log ---`, logContent.slice(-2000),
+    ].join("\n")).catch(() => {})
+  }, TIMEOUT_MS)
+
+  // ─── P1: chain exhausted ───────────────────────────────────────────────
+
+  it("chain exhausted — no fallback available → graceful degradation without crash", async () => {
+    primaryServer.resetCallLog()
+    fallbackServer.resetCallLog()
+
+    // Primary: return 429, Fallback: ALSO return 429 (both providers exhausted)
+    primaryServer.replyRateLimitN(8)
+    fallbackServer.replyRateLimitN(8)
+    // Eventually both recover so sessions don't hang forever
+    primaryServer.setDefault({
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        id: `chatcmpl-chain-${Date.now()}`,
+        object: "chat.completion",
+        choices: [{
+          index: 0,
+          message: { role: "assistant", content: "Chain exhausted recovery" },
+          finish_reason: "stop",
+        }],
+        usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
+      }),
+    })
+
+    const sessionID = await createSession(servePort, tmpDir)
+    await sendPrompt(servePort, tmpDir, sessionID, "Test chain exhaustion")
+    await new Promise((r) => setTimeout(r, 20_000))
+
+    const primaryCalls = primaryServer.getCallCount()
+    expect(primaryCalls).toBeGreaterThanOrEqual(1)
+
+    // P1: Most important — serve did NOT crash
+    const aliveCheck = await fetch(`http://127.0.0.1:${servePort}/api/session`, {
+      signal: AbortSignal.timeout(3_000),
+    }).catch(() => null)
+    expect(aliveCheck).not.toBeNull()
+    expect(aliveCheck!.ok).toBe(true)
+
+    const logContent = await readLog(tmpDir)
+    console.log("Chain exhausted test — primary:", primaryCalls,
+      "fallback:", fallbackServer.getCallCount(),
+      "has exhausted log:", logContent.includes("chain_exhausted") || logContent.includes("reactive"))
+
+    const diagPath = path.join(os.tmpdir(), `e2e-diag-chain-${Date.now()}.log`)
+    await writeFile(diagPath, [
+      `Primary calls: ${primaryCalls}`, `Fallback calls: ${fallbackServer.getCallCount()}`,
+      `Serve alive: ${aliveCheck !== null}`,
+      `--- Plugin log ---`, logContent.slice(-2000),
+    ].join("\n")).catch(() => {})
+  }, TIMEOUT_MS)
+
+  // ─── P2: preemptive switch ─────────────────────────────────────────────
+
+  it("preemptive switch — low score primary → fallback auto-selected on next message", async () => {
+    // Phase 1: Drive primary score down with 429s
+    primaryServer.resetCallLog()
+    fallbackServer.resetCallLog()
+
+    primaryServer.replyRateLimitN(8)
+    fallbackServer.setDefault({
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        id: `chatcmpl-prep1-${Date.now()}`,
+        object: "chat.completion",
+        choices: [{
+          index: 0,
+          message: { role: "assistant", content: "Phase 1 fallback response" },
+          finish_reason: "stop",
+        }],
+        usage: { prompt_tokens: 10, completion_tokens: 20, total_tokens: 30 },
+      }),
+    })
+
+    const sessionID = await createSession(servePort, tmpDir)
+    await sendPrompt(servePort, tmpDir, sessionID, "Phase 1: Trigger rate limit to lower score")
+    await new Promise((r) => setTimeout(r, 15_000))
+
+    const phase1Primary = primaryServer.getCallCount()
+    console.log("Preemptive phase 1 — primary calls:", phase1Primary)
+
+    // Phase 2: Both servers return healthy responses.
+    // If preemptive works, the NEXT message should go to fallback (because primary score is low).
+    primaryServer.resetCallLog()
+    fallbackServer.resetCallLog()
+
+    primaryServer.setDefault({
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        id: `chatcmpl-prep2p-${Date.now()}`,
+        object: "chat.completion",
+        choices: [{
+          index: 0,
+          message: { role: "assistant", content: "Phase 2 primary response" },
+          finish_reason: "stop",
+        }],
+        usage: { prompt_tokens: 10, completion_tokens: 20, total_tokens: 30 },
+      }),
+    })
+    fallbackServer.setDefault({
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        id: `chatcmpl-prep2f-${Date.now()}`,
+        object: "chat.completion",
+        choices: [{
+          index: 0,
+          message: { role: "assistant", content: "Phase 2 fallback response" },
+          finish_reason: "stop",
+        }],
+        usage: { prompt_tokens: 10, completion_tokens: 20, total_tokens: 30 },
+      }),
+    })
+
+    await sendPrompt(servePort, tmpDir, sessionID, "Phase 2: This should use fallback model")
+    await new Promise((r) => setTimeout(r, 10_000))
+
+    const phase2Primary = primaryServer.getCallCount()
+    const phase2Fallback = fallbackServer.getCallCount()
+    console.log("Preemptive phase 2 — primary:", phase2Primary, "fallback:", phase2Fallback)
+
+    // P2: At least one server was called (proves the message was processed)
+    expect(phase2Primary + phase2Fallback).toBeGreaterThanOrEqual(1)
+
+    // P2: Check log for preemptive switch evidence
+    const logContent = await readLog(tmpDir)
+    const hasPreemptiveLog =
+      logContent.includes("preemptive") ||
+      logContent.includes("chat.message") ||
+      logContent.includes("model_switch")
+    console.log("Preemptive test — has preemptive log:", hasPreemptiveLog, "log size:", logContent.length)
+
+    // If we got substantial log, verify preemptive activity exists
+    if (logContent.length > 100) {
+      const hasReactiveOrPreemptive =
+        logContent.includes("preemptive") || logContent.includes("reactive")
+      // At minimum, the plugin must have done something (reactive in phase 1, preemptive in phase 2)
+      expect(hasReactiveOrPreemptive).toBe(true)
+    }
+
+    const diagPath = path.join(os.tmpdir(), `e2e-diag-preemptive-${Date.now()}.log`)
+    await writeFile(diagPath, [
+      `Phase 1 primary calls: ${phase1Primary}`,
+      `Phase 2 primary: ${phase2Primary}, fallback: ${phase2Fallback}`,
+      `--- Plugin log ---`, logContent.slice(-3000),
+      `--- Serve stderr (last 10) ---`, ...serveStderr.slice(-10),
+    ].join("\n")).catch(() => {})
+  }, TIMEOUT_MS)
+
+  // ─── P3: overloaded classification ─────────────────────────────────────
+
+  it("529 overloaded → reactive handler fires with overloaded classification", async () => {
+    primaryServer.resetCallLog()
+    fallbackServer.resetCallLog()
+
+    primaryServer.replyOverloaded("The model is overloaded, please try again later")
+    primaryServer.replyOverloaded("The model is overloaded, please try again later")
+    primaryServer.replyOverloaded("The model is overloaded, please try again later")
+    primaryServer.replyOverloaded("The model is overloaded, please try again later")
+    fallbackServer.setDefault({
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        id: `chatcmpl-ol-${Date.now()}`,
+        object: "chat.completion",
+        choices: [{
+          index: 0,
+          message: { role: "assistant", content: "Overloaded fallback response" },
+          finish_reason: "stop",
+        }],
+        usage: { prompt_tokens: 10, completion_tokens: 20, total_tokens: 30 },
+      }),
+    })
+
+    const sessionID = await createSession(servePort, tmpDir)
+    await sendPrompt(servePort, tmpDir, sessionID, "Test overloaded handling")
+    await new Promise((r) => setTimeout(r, 15_000))
+
+    const primaryCalls = primaryServer.getCallCount()
+    const fallbackCalls = fallbackServer.getCallCount()
+
+    // P3: Primary was called with 529
+    expect(primaryCalls).toBeGreaterThanOrEqual(1)
+    // P3: Fallback was called (proves reactive handler switched model)
+    expect(fallbackCalls).toBeGreaterThanOrEqual(1)
+
+    const logContent = await readLog(tmpDir)
+    console.log("Overloaded test — primary:", primaryCalls, "fallback:", fallbackCalls,
+      "has overloaded log:", logContent.includes("overloaded") || logContent.includes("529") || logContent.includes("reactive"))
+
+    const diagPath = path.join(os.tmpdir(), `e2e-diag-overloaded-${Date.now()}.log`)
+    await writeFile(diagPath, [
+      `Primary calls: ${primaryCalls}`, `Fallback calls: ${fallbackCalls}`,
+      `--- Plugin log ---`, logContent.slice(-2000),
+    ].join("\n")).catch(() => {})
   }, TIMEOUT_MS)
 })

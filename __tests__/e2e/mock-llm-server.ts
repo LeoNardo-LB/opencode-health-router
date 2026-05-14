@@ -89,6 +89,45 @@ export class MockLLMServer {
     })
   }
 
+  /** Queue a 402 Payment Required / quota exceeded error */
+  replyQuotaExceeded(message = "402 Insufficient quota. Please check your plan and billing details."): this {
+    return this.respondWith({
+      status: 402,
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        error: { message, type: "insufficient_quota", code: 402 },
+      }),
+    })
+  }
+
+  /** Queue a 529 Overloaded error */
+  replyOverloaded(message = "529 The model is overloaded. Please try again later."): this {
+    return this.respondWith({
+      status: 529,
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        error: { message, type: "overloaded", code: 529 },
+      }),
+    })
+  }
+
+  /** Queue N consecutive overloaded errors */
+  replyOverloadedN(count: number, message = "529 The model is overloaded. Please try again later."): this {
+    for (let i = 0; i < count; i++) this.replyOverloaded(message)
+    return this
+  }
+
+  /** Queue a response with an arbitrary status code */
+  replyStatus(status: number, message: string): this {
+    return this.respondWith({
+      status,
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        error: { message, type: "error", code: status },
+      }),
+    })
+  }
+
   /** Queue a timeout (delayed response) */
   replyTimeout(delayMs: number): this {
     return this.respondWith({

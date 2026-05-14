@@ -335,15 +335,15 @@ describe.skipIf(shouldSkip)("E2E: opencode serve + Mock LLM", () => {
         const hasEnhancedOutput =
           allText.includes("429") ||
           allText.includes("限流") ||
+          allText.includes("rate_limit") ||
           allText.includes("opencode export")
         console.log("E2E child test — tool.execute.after output enhanced:", hasEnhancedOutput)
         console.log("E2E child test — assistant text length:", allText.length)
 
-        // Soft-check: if the plugin fully initialized, the output should be enhanced.
-        // If not (e.g. plugin lazy-load timing), this is informational — the hard
-        // assertion above (primaryCalls >= 1) already proves the mock was hit.
-        if (!hasEnhancedOutput && allText.length > 0) {
-          console.log("E2E child test — sample assistant text:", allText.slice(0, 500))
+        // P2: Hard assertion — if assistant text exists, it should contain 429 context
+        // (proves tool.execute.after hook enhanced the output)
+        if (allText.length > 100) {
+          expect(hasEnhancedOutput).toBe(true)
         }
       } else {
         console.log("E2E child test — messages API returned:", messagesRes.status)
@@ -375,6 +375,69 @@ describe.skipIf(shouldSkip)("E2E: opencode serve + Mock LLM", () => {
       ...serveStderr.slice(-20),
       `--- Plugin log ---`,
       logContent.slice(-2000),
+    ].join("\n")).catch(() => {})
+  }, TIMEOUT_MS)
+
+  // ─── P3: chain_exhausted — all models fail → no crash ──────────────────
+
+  it("both primary and fallback fail → serve remains stable without crash", async () => {
+    primaryServer.resetCallLog()
+    fallbackServer.resetCallLog()
+
+    // Primary: return 429s, Fallback: ALSO return 429s (both exhausted)
+    primaryServer.replyRateLimitN(6)
+    fallbackServer.replyRateLimitN(6)
+    // Eventually primary recovers so the session can complete
+    primaryServer.setDefault({
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        id: `chatcmpl-both-${Date.now()}`,
+        object: "chat.completion",
+        choices: [{
+          index: 0,
+          message: { role: "assistant", content: "Both-fail recovery" },
+          finish_reason: "stop",
+        }],
+        usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
+      }),
+    })
+
+    const dirParam = `?directory=${encodeURIComponent(tmpDir)}`
+    const sessionRes = await fetch(`http://127.0.0.1:${servePort}/session${dirParam}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({}),
+    })
+    expect(sessionRes.ok).toBe(true)
+    const session = await sessionRes.json()
+    const sessionID = session.id ?? session.data?.id
+
+    await sendPrompt(servePort, tmpDir, sessionID, "Test both providers failing")
+    await new Promise((r) => setTimeout(r, 20_000))
+
+    // P3: Primary was called
+    const primaryCalls = primaryServer.getCallCount()
+    expect(primaryCalls).toBeGreaterThanOrEqual(1)
+
+    // P3: Most important — serve is still alive (no crash from chain exhaustion)
+    const aliveCheck = await fetch(`http://127.0.0.1:${servePort}/api/session`, {
+      signal: AbortSignal.timeout(3_000),
+    }).catch(() => null)
+    expect(aliveCheck).not.toBeNull()
+    expect(aliveCheck!.ok).toBe(true)
+
+    const logPath = path.join(tmpDir, "health-router.log")
+    const logContent = await readFile(logPath, "utf-8").catch(() => "")
+    console.log("Both-fail test — primary:", primaryCalls, "fallback:", fallbackServer.getCallCount(),
+      "serve alive:", aliveCheck !== null,
+      "has exhausted log:", logContent.includes("chain_exhausted") || logContent.includes("same_model") || logContent.includes("reactive"))
+
+    const diagPath = path.join(os.tmpdir(), `e2e-diag-both-fail-${Date.now()}.log`)
+    await writeFile(diagPath, [
+      `Primary calls: ${primaryCalls}`, `Fallback calls: ${fallbackServer.getCallCount()}`,
+      `Serve alive: ${aliveCheck !== null}`,
+      `--- Plugin log ---`, logContent.slice(-2000),
     ].join("\n")).catch(() => {})
   }, TIMEOUT_MS)
 })
