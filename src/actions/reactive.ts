@@ -36,8 +36,6 @@ interface ReactiveContext {
   dedupSet: Set<string>
   pluginPromptedSessions: Set<string>
   messageCache: Map<string, Array<{ modelKey: string; agentName: string; messageID: string }>>
-  /** Per-model retry counter for serve-mode attempt tracking */
-  retryCounter?: RetryCounter
   /** Anti-cascading: prevents re-processing retry events after a fallback chain has already executed */
   handledRetrySessions: Set<string>
   /** Set of child session IDs (subagents) — used to detect subagent sessions */

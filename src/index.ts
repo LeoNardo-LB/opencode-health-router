@@ -12,7 +12,6 @@ import { ModelSelector } from "./selection/selector.js"
 import { handleChatMessage } from "./actions/preemptive.js"
 import { handleReactiveEvent, cleanupDedupForSession, cleanupDedupBySize } from "./actions/reactive.js"
 import { RetryCounter } from "./retry/counter.js"
-import { RetryCounter } from "./retry/counter.js"
 
 // ─── Exported testable handlers (P3 + P5) ─────────────────────────────────
 
