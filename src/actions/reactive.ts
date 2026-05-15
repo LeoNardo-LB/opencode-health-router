@@ -4,6 +4,7 @@ import type { ModelSelector } from "../selection/selector.js"
 import type { Logger } from "../logging/logger.js"
 import { classify } from "../classification/classifier.js"
 import { shouldIntervene } from "../retry/policy.js"
+import { RetryCounter } from "../retry/counter.js"
 import { splitModelKey } from "../types.js"
 import type { ClassificationRule } from "../types.js"
 
@@ -29,10 +30,14 @@ interface ReactiveContext {
   selector: ModelSelector
   rules: ClassificationRule[]
   maxRetries: number
+  /** Per-model retry counter for serve-mode attempt tracking */
+  retryCounter?: RetryCounter
   logger: Logger
   dedupSet: Set<string>
   pluginPromptedSessions: Set<string>
   messageCache: Map<string, Array<{ modelKey: string; agentName: string; messageID: string }>>
+  /** Per-model retry counter for serve-mode attempt tracking */
+  retryCounter?: RetryCounter
   /** Anti-cascading: prevents re-processing retry events after a fallback chain has already executed */
   handledRetrySessions: Set<string>
   /** Set of child session IDs (subagents) — used to detect subagent sessions */
@@ -94,9 +99,18 @@ export async function handleReactiveEvent(
     return
   }
 
-  // ② Retry gate
-  if (!shouldIntervene(attempt, ctx.maxRetries)) {
-    ctx.logger.debug("reactive.retry_gate", { sessionID, attempt, maxRetries: ctx.maxRetries })
+  // ② Retry gate — use plugin-side counter for serve mode
+  // OpenCode serve always emits attempt=1 with new sessionID per retry.
+  // We count consecutive failures per model within a time window.
+  const cacheStack = ctx.messageCache.get(sessionID)
+  const peekModel = cacheStack && cacheStack.length > 0 ? cacheStack[cacheStack.length - 1].modelKey : undefined
+  let effectiveAttempt = attempt
+  if (peekModel && ctx.retryCounter) {
+    effectiveAttempt = ctx.retryCounter.increment(peekModel)
+    ctx.logger.debug("reactive.counter_incremented", { sessionID, model: peekModel, count: effectiveAttempt })
+  }
+  if (!shouldIntervene(effectiveAttempt, ctx.maxRetries)) {
+    ctx.logger.debug("reactive.retry_gate", { sessionID, attempt, effectiveAttempt, maxRetries: ctx.maxRetries })
     ctx.handledRetrySessions.delete(sessionID)
     return
   }
@@ -130,6 +144,11 @@ export async function handleReactiveEvent(
         if (stack.length === 0) ctx.messageCache.delete(sessionID)
       }
       ctx.logger.info("reactive.child_aborted", { sessionID })
+      // Reset counter — this model triggered intervention, no need to keep counting
+      if (peekModel && ctx.retryCounter) {
+        ctx.retryCounter.reset(peekModel)
+        ctx.logger.debug("reactive.counter_reset_child", { sessionID, model: peekModel })
+      }
     } catch (err) {
       ctx.logger.error("reactive.child_abort_failed", { sessionID, error: String(err) })
       // Clean up anti-cascading flag so future retry events can be processed.
@@ -323,6 +342,12 @@ export async function handleReactiveEvent(
       to: nextKey,
       agent: agentName,
     })
+
+    // Reset counter for original model — we've switched away, no need to keep counting
+    if (ctx.retryCounter) {
+      ctx.retryCounter.reset(currentModelKey)
+      ctx.logger.debug("reactive.counter_reset_fallback", { sessionID, model: currentModelKey })
+    }
 
     if (ctx.client.tui) {
       try {

@@ -11,6 +11,8 @@ import { HealthStore } from "./health/store.js"
 import { ModelSelector } from "./selection/selector.js"
 import { handleChatMessage } from "./actions/preemptive.js"
 import { handleReactiveEvent, cleanupDedupForSession, cleanupDedupBySize } from "./actions/reactive.js"
+import { RetryCounter } from "./retry/counter.js"
+import { RetryCounter } from "./retry/counter.js"
 
 // ─── Exported testable handlers (P3 + P5) ─────────────────────────────────
 
@@ -84,6 +86,7 @@ let sharedHandledRetrySessions: Set<string> | null = null
 let sharedMessageCache: Map<string, Array<{ modelKey: string; agentName: string; messageID: string }>> | null = null
 let sharedChildSessions: Set<string> | null = null
 let sharedAbortedChildren: Set<string> | null = null
+let sharedRetryCounter: RetryCounter | null = null
 let tickTimerStarted = false
 
 export default {
@@ -142,6 +145,8 @@ export default {
   if (!sharedMessageCache) sharedMessageCache = new Map<string, Array<{ modelKey: string; agentName: string; messageID: string }>>()
   if (!sharedChildSessions) sharedChildSessions = new Set<string>()
   if (!sharedAbortedChildren) sharedAbortedChildren = new Set<string>()
+  if (!sharedRetryCounter) sharedRetryCounter = new RetryCounter(config.retryPolicy.retryWindowMs)
+  if (!sharedRetryCounter) sharedRetryCounter = new RetryCounter(config.retryPolicy.retryWindowMs)
 
   const store = sharedStore
   const selector = sharedSelector
@@ -151,6 +156,7 @@ export default {
   const messageCache = sharedMessageCache
   const childSessions = sharedChildSessions
   const abortedChildren = sharedAbortedChildren
+  const retryCounter = sharedRetryCounter
 
   logger.debug("plugin.components_initialized", {
     agents: Object.keys(config.agents),
@@ -165,6 +171,8 @@ export default {
       store.tick()
       // Dedup capacity cleanup: clear oldest 50% when exceeding 10000 (spec §8.3)
       cleanupDedupBySize(dedupSet)
+      // Retry counter periodic cleanup (spec §4④)
+      retryCounter?.cleanup()
     }, 30_000)
     if (tickTimer.unref) tickTimer.unref()
   }
@@ -180,6 +188,8 @@ export default {
     if (info.time?.completed && info.providerID && info.modelID) {
       const key = `${info.providerID}/${info.modelID}`
       store.recordSuccess(key)
+      // Reset retry counter on success — model is healthy again (spec §4②)
+      retryCounter?.reset(key)
       logger.debug("health.success_recorded", { model: key, score: store.get(key) })
     }
   }
@@ -284,6 +294,7 @@ export default {
         selector,
         rules: config.classification.rules,
         maxRetries: config.retryPolicy.maxRetries,
+        retryCounter,
         logger,
         dedupSet,
         pluginPromptedSessions,
