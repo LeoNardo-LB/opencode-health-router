@@ -11,6 +11,7 @@ import {
   DEFAULT_FALLBACK_RECOVERY_BONUS,
   DEFAULT_FALLBACK_SUCCESS_BONUS,
   DEFAULT_MAX_RETRIES,
+  DEFAULT_RETRY_WINDOW_MS,
   DEFAULT_LOG_LEVEL,
 } from "./defaults.js"
 
@@ -109,9 +110,10 @@ function buildTemplate(agentNames: string[]): string {
     }
   },
 
-  // 重试策略：OpenCode 自行重试 maxRetries 次后，插件接管切换
+  // 重试策略：模型连续失败 maxRetries 次后（retryWindowMs 时间窗口内），插件接管切换
   "retryPolicy": {
-    "maxRetries": ${DEFAULT_MAX_RETRIES}
+    "maxRetries": ${DEFAULT_MAX_RETRIES},
+    "retryWindowMs": ${DEFAULT_RETRY_WINDOW_MS}   // 计数器时间窗口（毫秒），同一模型在此窗口内连续失败 maxRetries 次触发降级
   },
 
   // ─── Agent 降级链 ───

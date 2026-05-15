@@ -10,6 +10,7 @@ import {
   DEFAULT_FALLBACK_RECOVERY_BONUS,
   DEFAULT_FALLBACK_SUCCESS_BONUS,
   DEFAULT_MAX_RETRIES,
+  DEFAULT_RETRY_WINDOW_MS,
   DEFAULT_LOG_LEVEL,
 } from "./defaults.js"
 
@@ -35,6 +36,7 @@ const healthScoreSchema = z.object({
 
 const retryPolicySchema = z.object({
   maxRetries: z.number().int().min(1).max(20).default(DEFAULT_MAX_RETRIES),
+  retryWindowMs: z.number().int().min(10_000).max(600_000).default(DEFAULT_RETRY_WINDOW_MS),
 }).default({})
 
 const agentChainSchema = z.object({

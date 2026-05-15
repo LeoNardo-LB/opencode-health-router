@@ -40,6 +40,8 @@ export interface HealthScoreConfig {
 
 export interface RetryPolicyConfig {
   maxRetries: number
+  /** Time window (ms) for counting consecutive model failures. Default: 60000 */
+  retryWindowMs?: number
 }
 
 export interface AgentChainConfig {

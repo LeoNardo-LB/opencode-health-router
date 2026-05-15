@@ -14,6 +14,7 @@ export const DEFAULT_FALLBACK_RECOVERY_BONUS = 5
 export const DEFAULT_FALLBACK_SUCCESS_BONUS = 5
 
 export const DEFAULT_MAX_RETRIES = 3
+export const DEFAULT_RETRY_WINDOW_MS = 60_000  // 60 seconds
 
 export const DEFAULT_LOG_LEVEL = "warn"
 
@@ -38,7 +39,7 @@ export const DEFAULT_CONFIG: Config = {
       successBonus: DEFAULT_FALLBACK_SUCCESS_BONUS,
     },
   },
-  retryPolicy: { maxRetries: DEFAULT_MAX_RETRIES },
+  retryPolicy: { maxRetries: DEFAULT_MAX_RETRIES, retryWindowMs: DEFAULT_RETRY_WINDOW_MS },
   agents: { "*": { fallbackModels: [] } },
   primaryModels: new Set(),
   agentModels: {},
