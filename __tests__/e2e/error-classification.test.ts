@@ -5,6 +5,7 @@ import { handleReactiveEvent } from "../../src/actions/reactive.js"
 import { classify } from "../../src/classification/classifier.js"
 import { BUILTIN_RULES } from "../../src/classification/patterns.js"
 import { shouldIntervene } from "../../src/retry/policy.js"
+import { RetryCounter } from "../../src/retry/counter.js"
 import { createLogger } from "../../src/logging/logger.js"
 import type { Config } from "../../src/types.js"
 
@@ -329,17 +330,23 @@ describe("C: 错误分类与边界", () => {
   })
 
   // ─────────────────────────────────────────────────────────────────────────
-  // C4: attempt 精确阈值
-  // 验证 shouldIntervene 的 off-by-one 行为 (attempt > maxRetries)
+  // C4: RetryCounter 集成 — 连续失败计数触发降级
+  // 验证: 同一模型在时间窗口内连续失败 maxRetries 次后 shouldIntervene 触发
   // ─────────────────────────────────────────────────────────────────────────
-  describe("C4: attempt 精确阈值", () => {
-    it("attempt=3 不介入 (3 > 3 为 false), attempt=4 介入 (4 > 3 为 true)", async () => {
-      // 直接验证 shouldIntervene 的 off-by-one 行为
-      expect(shouldIntervene(3, 3)).toBe(false) // 3 > 3 = false
-      expect(shouldIntervene(4, 3)).toBe(true) // 4 > 3 = true
+  describe("C4: RetryCounter 连续失败计数", () => {
+    it("连续失败 maxRetries 次后介入（serve 模式：每次 attempt=1）", async () => {
+      // RetryCounter 单元行为验证
+      const counter = new RetryCounter(60_000)
+      expect(counter.increment("zhipuai/glm-5.1")).toBe(1)
+      expect(counter.increment("zhipuai/glm-5.1")).toBe(2)
+      expect(counter.increment("zhipuai/glm-5.1")).toBe(3)
+      // 3 > 3 = false, no intervention yet
+      expect(shouldIntervene(3, 3)).toBe(false)
+      // 4 > 3 = true, triggers intervention!
+      expect(shouldIntervene(counter.increment("zhipuai/glm-5.1"), 3)).toBe(true)
 
-      // Step 1: 配置 maxRetries=3
-      const config = makeConfig({ retryPolicy: { maxRetries: 3 } })
+      // 集成测试：配置 maxRetries=3
+      const config = makeConfig({ retryPolicy: { maxRetries: 3, retryWindowMs: 60_000 } })
       const store = new HealthStore(config)
       const selector = new ModelSelector(config, store)
       const dedupSet = new Set<string>()
@@ -349,84 +356,108 @@ describe("C: 错误分类与边界", () => {
         string,
         Array<{ modelKey: string; agentName: string; messageID: string }>
       >()
+      const retryCounter = new RetryCounter(60_000)
       const logger = createLogger({ level: "debug" })
 
-      // cache + messages mock (attempt=4 时需要完整链路)
-      messageCache.set("ses-c4", [
-        {
+      // Helper: set up cache for each new session
+      const setupCache = (sid: string) => {
+        const messageID = `msg-${sid}-user`
+        messageCache.set(sid, [{
           modelKey: "zhipuai/glm-5.1",
           agentName: "build",
-          messageID: "msg-c4-user",
-        },
-      ])
+          messageID,
+        }])
+      }
 
       const client = mockClient("success")
+
+      // Step 1: 第一次 retry (session-A, attempt=1) → 计数=1, 不介入
+      const sidA = "ses-c4-a"
+      setupCache(sidA)
       client.session.messages = vi.fn().mockResolvedValue({
-        data: [
-          {
-            info: {
-              id: "msg-c4-user",
-              role: "user",
-              model: { providerID: "zhipuai", modelID: "glm-5.1" },
-              agent: "build",
-            },
-            parts: [{ type: "text", text: "test" }],
-          },
-        ],
+        data: [{
+          info: { id: "msg-ses-c4-a-user", role: "user", model: { providerID: "zhipuai", modelID: "glm-5.1" }, agent: "build" },
+          parts: [{ type: "text", text: "test" }],
+        }],
       })
-
-      // Step 2: 发送 session.status retry (attempt=3, message="500 error")
       await handleReactiveEvent(
         {
           type: "session.status",
-          properties: {
-            sessionID: "ses-c4",
-            status: { type: "retry", attempt: 3, message: "500 error" },
-          },
+          properties: { sessionID: sidA, status: { type: "retry", attempt: 1, message: "500 error" } },
         } as any,
         {
-          client: client as any,
-          store,
-          selector,
-          rules: config.classification.rules,
-          maxRetries: 3,
-          logger,
-          dedupSet,
-          pluginPromptedSessions,
-          messageCache,
-          handledRetrySessions,
+          client: client as any, store, selector, rules: config.classification.rules,
+          maxRetries: 3, retryCounter, logger, dedupSet, pluginPromptedSessions, messageCache, handledRetrySessions,
         },
       )
-
-      // 断言 3: 不介入（attempt=3 ≤ maxRetries=3 → shouldIntervene=false）
       expect(client.session.abort).not.toHaveBeenCalled()
+      expect(retryCounter.getCount("zhipuai/glm-5.1")).toBe(1)
 
-      // Step 4: 发送 session.status retry (attempt=4, message="500 error")
+      // Step 2: 第二次 retry (session-B, attempt=1) → 计数=2, 不介入
+      const sidB = "ses-c4-b"
+      setupCache(sidB)
+      client.session.messages = vi.fn().mockResolvedValue({
+        data: [{
+          info: { id: "msg-ses-c4-b-user", role: "user", model: { providerID: "zhipuai", modelID: "glm-5.1" }, agent: "build" },
+          parts: [{ type: "text", text: "test" }],
+        }],
+      })
       await handleReactiveEvent(
         {
           type: "session.status",
-          properties: {
-            sessionID: "ses-c4",
-            status: { type: "retry", attempt: 4, message: "500 error" },
-          },
+          properties: { sessionID: sidB, status: { type: "retry", attempt: 1, message: "500 error" } },
         } as any,
         {
-          client: client as any,
-          store,
-          selector,
-          rules: config.classification.rules,
-          maxRetries: 3,
-          logger,
-          dedupSet,
-          pluginPromptedSessions,
-          messageCache,
-          handledRetrySessions,
+          client: client as any, store, selector, rules: config.classification.rules,
+          maxRetries: 3, retryCounter, logger, dedupSet, pluginPromptedSessions, messageCache, handledRetrySessions,
         },
       )
+      expect(client.session.abort).not.toHaveBeenCalled()
+      expect(retryCounter.getCount("zhipuai/glm-5.1")).toBe(2)
 
-      // 断言 5: 介入（attempt=4 > maxRetries=3 → shouldIntervene=true）
-      // 断言 6: abort 被调用
-      expect(client.session.abort).toHaveBeenCalledWith({ path: { id: "ses-c4" } })
+      // Step 3: 第三次 retry (session-C, attempt=1) → 计数=3, 3 > 3 = false, 不介入
+      const sidC = "ses-c4-c"
+      setupCache(sidC)
+      client.session.messages = vi.fn().mockResolvedValue({
+        data: [{
+          info: { id: "msg-ses-c4-c-user", role: "user", model: { providerID: "zhipuai", modelID: "glm-5.1" }, agent: "build" },
+          parts: [{ type: "text", text: "test" }],
+        }],
+      })
+      await handleReactiveEvent(
+        {
+          type: "session.status",
+          properties: { sessionID: sidC, status: { type: "retry", attempt: 1, message: "500 error" } },
+        } as any,
+        {
+          client: client as any, store, selector, rules: config.classification.rules,
+          maxRetries: 3, retryCounter, logger, dedupSet, pluginPromptedSessions, messageCache, handledRetrySessions,
+        },
+      )
+      expect(client.session.abort).not.toHaveBeenCalled()
+      expect(retryCounter.getCount("zhipuai/glm-5.1")).toBe(3)
+
+      // Step 4: 第四次 retry (session-D, attempt=1) → 计数=4, 4 > 3 = true, 介入!
+      const sidD = "ses-c4-d"
+      setupCache(sidD)
+      client.session.messages = vi.fn().mockResolvedValue({
+        data: [{
+          info: { id: "msg-ses-c4-d-user", role: "user", model: { providerID: "zhipuai", modelID: "glm-5.1" }, agent: "build" },
+          parts: [{ type: "text", text: "test" }],
+        }],
+      })
+      await handleReactiveEvent(
+        {
+          type: "session.status",
+          properties: { sessionID: sidD, status: { type: "retry", attempt: 1, message: "500 error" } },
+        } as any,
+        {
+          client: client as any, store, selector, rules: config.classification.rules,
+          maxRetries: 3, retryCounter, logger, dedupSet, pluginPromptedSessions, messageCache, handledRetrySessions,
+        },
+      )
+      // 4 > 3 = true → intervention triggered
+      expect(client.session.abort).toHaveBeenCalled()
     })
   })
 })
